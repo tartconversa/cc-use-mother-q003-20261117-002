@@ -6,13 +6,23 @@ CycleFlow 面向样机研发团队，接收设计修订、部件批次、生产�
 
 依赖版本锁定在 `requirements.txt`。在项目目录运行 `python -m unittest discover -s tests -v` 执行业务测试，`python -m compileall -q cycleflow` 检查源码，`python -m cycleflow.demo` 运行合成数据验收。安装所列依赖后，可设置 `CYCLEFLOW_DB` 为可写的数据库路径，再运行 `uvicorn cycleflow.api:app` 启动 HTTP 服务。命令行帮助为 `python -m cycleflow --db cycleflow.sqlite3 --help`。
 
-演示仅使用临时数据库和本地合成产品。它分两次导入同一清单，验证试验良率，冻结月报，并审计存储的状态链；正常运行无需访问外部服务。
+演示仅使用临时数据库和本地合成产品。它分两次导入同一清单，验证试验良率，冻结月报，再导入一条带证据的试验更正并对比冻结值与当前值，最后审计存储的状态链；正常运行无需访问外部服务。
 
 ## 事件协议
 
 向 `/events` 提交 `source`、`external_id`、`kind`、带时区的 `occurred_at` 和对象类型的 `payload`。相同事件重放返回既有编号；相同身份提交不同内容返回冲突。缺少前置对象或暂时缺料的事件进入待处理状态，可调用 `/events/{id}/retry` 补齐后重试。其他业务无效事件仍保留拒绝原因。批量接口每次使用稳定的批次编号和完整事件数组；系统核对清单指纹，从已提交的行继续。
 
-事件类型包括 `design.release`、`design.retire`、`lot.receive`、`lot.quarantine`、`job.open`、`job.stage_start`、`job.stage_finish`、`job.scrap`、`plan.create` 和 `test.record`。设计包含产品、版本、部件数量及可选的父版本。部件批次包含料号、供应商和正整数数量。工单绑定一个设计和产量，成功预留物料后依次经过加工、装配和集成。试验计划绑定精确的产品版本，受测数量必须覆盖该工单全部单位。
+事件类型包括 `design.release`、`design.retire`、`lot.receive`、`lot.quarantine`、`job.open`、`job.stage_start`、`job.stage_finish`、`job.scrap`、`plan.create`、`test.record`、`test.correct` 和 `test.void`。设计包含产品、版本、部件数量及可选的父版本。部件批次包含料号、供应商和正整数数量。工单绑定一个设计和产量，成功预留物料后依次经过加工、装配和集成。试验计划绑定精确的产品版本，受测数量必须覆盖该工单全部单位。
+
+### 试验更正与作废
+
+质量复核通过带证据的事件纠正试验记录，原始试验事件永不修改或删除：
+
+- `test.correct` 携带 `correction_id`、目标（`target_type` 为 `test` 或 `correction`，配合 `target_id`）、新的 `passed`/`failed` 数量（仍须覆盖工单全部单位）、`reason` 和非空 `evidence`。目标节点被标记为 `superseded`，更正成为新的有效结论，工单终态按计划阈值重新收敛为 `completed` 或 `failed`。
+- `test.void` 作废当前有效结论，必须给出原因与证据。作废节点保留为有效墓碑，工单回到 `awaiting_test`；其后可用新的 `test.record` 重新试验，旧链与新链同时保留。
+- 每个工单在当前链段内至多有一条有效结论。重复提交走事件幂等；目标已被替代或已是作废墓碑返回 `correction_conflict`；指向自身的循环替代被拒绝；更正先于原试验到达时进入 `waiting`，原试验入库后重试即可收敛。
+- 基于失败结论创建的返工子工单在 `rework_links` 中留下资格依据。父工单结论被更正为通过或被作废时，资格标记为 `retracted`，子工单保留但不能再以该父工单新开返工。
+- 报表、版本良率、周度、返工分组和供应商归因只统计有效结论；作业详情同时返回完整 `tests`、`corrections` 链与 `effective_conclusion`。已发布月报保持冻结原值，`/releases/{id}/freshness` 额外返回冻结/当前汇总差异和按工单的更正解释。
 
 ## 报表与发布
 

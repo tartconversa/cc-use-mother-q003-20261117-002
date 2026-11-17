@@ -109,6 +109,10 @@ def create_app(db_path=None):
     def test(test_id: str):
         return service.get_test(test_id)
 
+    @app.get("/corrections/{correction_id}")
+    def correction(correction_id: str):
+        return service.get_correction(correction_id)
+
     @app.get("/reports/{product}")
     def report(product: str, window_start: str, window_end: str):
         return service.report(product, window_start, window_end)

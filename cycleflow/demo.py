@@ -40,6 +40,17 @@ def scenario():
     ]
 
 
+def correction_scenario():
+    """Quality review corrects a mislabeled test after the monthly freeze."""
+    events = scenario()
+    events.append(event(13, "test.correct", 40, {
+        "correction_id": "C1", "target_type": "test", "target_id": "T1",
+        "passed": 1, "failed": 3,
+        "reason": "QMS review: failed units were mislabeled as passed",
+        "evidence": "NCR-2026-007"}))
+    return events
+
+
 def run():
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "cycleflow.sqlite3"
@@ -53,11 +64,31 @@ def run():
         assert report["quality"]["publishable"]
         frozen = service.publish("jan-demo", "robot-arm", START, END, report["fingerprint"])
         assert frozen["report"]["summary"]["pass_rate"] == "0.75"
+        # Evidenced correction arrives after the freeze; original event is retained.
+        service.ingest_batch("corrections", correction_scenario()[12:])
+        current = service.report("robot-arm", START, END)
+        assert current["summary"]["passed_units"] == 1
+        assert current["jobs"][0]["effective_conclusion"]["node_id"] == "C1"
+        assert current["jobs"][0]["tests"][0]["state"] == "superseded"
+        freshness = service.shelf.freshness("jan-demo")
+        assert freshness["current_differs"]
+        assert freshness["frozen_summary"]["passed_units"] == 3
+        assert freshness["current_summary"]["passed_units"] == 1
+        explanation = freshness["explanations"][0]
+        assert explanation["frozen_conclusion"]["node_id"] == "T1"
+        assert explanation["current_conclusion"]["node_id"] == "C1"
+        # The frozen monthly report itself never moves.
+        assert service.get_release("jan-demo")["fingerprint"] == frozen["fingerprint"]
         audit = IntegrityAudit(service.store).run("robot-arm")
         assert audit["ok"], audit
         return {"batch": {"first_cursor": first["next_line"], "complete": rest["completed"]},
                 "report": report["summary"], "quality": report["quality"],
-                "release_id": frozen["release_id"], "audit": audit}
+                "release_id": frozen["release_id"],
+                "corrected_summary": current["summary"],
+                "frozen_vs_current": {"frozen": freshness["frozen_summary"],
+                                      "current": freshness["current_summary"],
+                                      "explanations": freshness["explanations"]},
+                "audit": audit}
 
 
 def main():

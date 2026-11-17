@@ -11,7 +11,7 @@ from .measure import MeasurementRules
 KINDS = {
     "design.release", "design.retire", "lot.receive", "lot.quarantine",
     "job.open", "job.stage_start", "job.stage_finish", "job.scrap",
-    "plan.create", "test.record",
+    "plan.create", "test.record", "test.correct", "test.void",
 }
 
 
@@ -130,6 +130,8 @@ class EventLedger:
             payload = event["payload"]
             if event["kind"] == "test.record" and event["state"] == "accepted":
                 event["trace"] = MeasurementRules(db).trace(payload["test_id"])
+            elif event["kind"] in {"test.correct", "test.void"} and event["state"] == "accepted":
+                event["trace"] = MeasurementRules(db).correction_trace(payload["correction_id"])
             elif event["kind"].startswith("job.") and event["state"] == "accepted":
                 event["trace"] = ExecutionRules(db).lineage(payload["job_id"])
             return event

@@ -1,6 +1,7 @@
 import json
 from collections import defaultdict
 
+from . import conclusions
 from .contracts import DomainError, MissingDependency, fingerprint, required_text
 from .design import DesignRules
 from .execution import ExecutionRules
@@ -106,8 +107,24 @@ class IntegrityAudit:
                 findings.append(self._issue("premature_test_state", job_id))
             if job["parent_job"]:
                 parent = db.execute("SELECT status FROM jobs WHERE job_id=?", (job["parent_job"],)).fetchone()
-                if parent is None or parent["status"] not in ("failed", "scrapped"):
+                link = db.execute("SELECT * FROM rework_links WHERE child_job=?", (job_id,)).fetchone()
+                retracted = link is not None and link["state"] == "retracted"
+                if parent is None:
                     findings.append(self._issue("invalid_rework_parent", job_id))
+                elif parent["status"] not in ("failed", "scrapped") and not retracted:
+                    # A retracted link documents that this rework outlived the
+                    # failed verdict that originally qualified it.
+                    findings.append(self._issue("invalid_rework_parent", job_id))
+                if parent is not None and parent["status"] == "failed":
+                    # Quality-failure rework must carry the qualifying conclusion.
+                    if link is None:
+                        findings.append(self._issue("missing_rework_qualification", job_id))
+                    elif link["state"] != "active":
+                        findings.append(self._issue("retracted_rework_still_failed", job_id))
+                elif parent is not None and parent["status"] == "completed" and link is not None:
+                    # Parent verdict moved to pass: the qualification must be retracted, not active.
+                    if link["state"] == "active":
+                        findings.append(self._issue("unretracted_rework_basis", job_id))
             if job["status"] != "scrapped":
                 assigned = {row["part"]: row["quantity"] for row in db.execute(
                     "SELECT l.part,SUM(r.quantity) quantity FROM reservations r JOIN lots l ON l.lot_id=r.lot_id WHERE r.job_id=? GROUP BY l.part",
@@ -130,8 +147,73 @@ class IntegrityAudit:
             plan = db.execute("SELECT * FROM plans WHERE plan_id=?", (test["plan_id"],)).fetchone()
             if plan is None or (plan["product"], plan["revision"]) != (test["product"], test["revision"]):
                 findings.append(self._issue("test_plan_revision", subject))
-            if test["status"] not in ("completed", "failed"):
-                findings.append(self._issue("test_job_status", subject))
+            if test["state"] not in ("effective", "superseded"):
+                findings.append(self._issue("test_state", subject))
+        for job_id, in db.execute("SELECT DISTINCT job_id FROM tests" +
+                                  (" JOIN jobs j USING(job_id) JOIN designs d ON d.design_id=j.design_id "
+                                   "WHERE d.product=?" if product else ""),
+                                  (product,) if product else ()):
+            try:
+                node = conclusions.effective_conclusion(db, job_id)
+            except DomainError:
+                findings.append(self._issue("dual_conclusion", job_id))
+                node = None
+            job = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if node is None and job["status"] not in ("awaiting_test", "scrapped"):
+                findings.append(self._issue("test_job_status", job_id))
+            elif node is not None:
+                is_void = node["node_type"] == "correction" and node["action"] == "void"
+                if is_void:
+                    if job["status"] != "awaiting_test":
+                        findings.append(self._issue("test_job_status", job_id))
+                elif job["status"] not in ("completed", "failed"):
+                    findings.append(self._issue("test_job_status", job_id))
+        findings.extend(self._correction_checks(db, product))
+        findings.extend(self._rework_link_checks(db, product))
+        return findings
+
+    def _correction_checks(self, db, product):
+        findings = []
+        sql = ("SELECT c.*,d.product FROM test_corrections c JOIN jobs j ON j.job_id=c.job_id "
+               "JOIN designs d ON d.design_id=j.design_id" +
+               (" WHERE d.product=?" if product else "") + " ORDER BY c.correction_id")
+        for correction in db.execute(sql, (product,) if product else ()):
+            subject = correction["correction_id"]
+            if correction["state"] not in ("effective", "superseded"):
+                findings.append(self._issue("correction_state", subject))
+            if correction["action"] == "correct":
+                if correction["passed"] is None or correction["failed"] is None:
+                    findings.append(self._issue("correction_counts", subject))
+                else:
+                    quantity = db.execute("SELECT quantity FROM jobs WHERE job_id=?",
+                                          (correction["job_id"],)).fetchone()["quantity"]
+                    if correction["passed"] + correction["failed"] != quantity:
+                        findings.append(self._issue("correction_counts", subject))
+            elif correction["passed"] is not None or correction["failed"] is not None:
+                findings.append(self._issue("correction_counts", subject))
+            if correction["target_type"] == "test":
+                target = db.execute("SELECT 1 FROM tests WHERE test_id=? AND job_id=?",
+                                    (correction["target_id"], correction["job_id"])).fetchone()
+            else:
+                target = db.execute("SELECT 1 FROM test_corrections WHERE correction_id=? AND job_id=?",
+                                    (correction["target_id"], correction["job_id"])).fetchone()
+            if target is None:
+                findings.append(self._issue("correction_target", subject))
+        return findings
+
+    def _rework_link_checks(self, db, product):
+        findings = []
+        sql = ("SELECT r.*,d.product FROM rework_links r JOIN jobs j ON j.job_id=r.child_job "
+               "JOIN designs d ON d.design_id=j.design_id" +
+               (" WHERE d.product=?" if product else ""))
+        for link in db.execute(sql, (product,) if product else ()):
+            subject = link["child_job"]
+            if link["state"] not in ("active", "retracted"):
+                findings.append(self._issue("rework_link_state", subject))
+            if link["state"] == "retracted" and link["retracted_event"] is None:
+                findings.append(self._issue("rework_link_retraction", subject))
+            if (link["basis_test_id"] is None) == (link["basis_correction_id"] is None):
+                findings.append(self._issue("rework_link_basis", subject))
         return findings
 
     def _release_checks(self, db, product):

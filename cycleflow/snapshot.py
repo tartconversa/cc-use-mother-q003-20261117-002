@@ -64,4 +64,27 @@ class ReportShelf:
         return {"release_id": release_id, "frozen_fingerprint": frozen["fingerprint"],
                 "current_fingerprint": current["fingerprint"],
                 "current_differs": current["fingerprint"] != frozen["fingerprint"],
-                "frozen_source_head": frozen["source_head"], "current_source_head": current["source_head"]}
+                "frozen_source_head": frozen["source_head"], "current_source_head": current["source_head"],
+                "frozen_summary": report["summary"], "current_summary": current["summary"],
+                "explanations": self._explain(report, current)}
+
+    def _explain(self, frozen, current):
+        """Per-job explanation of why the current view diverged from the freeze."""
+        frozen_jobs = {job["job_id"]: job for job in frozen["jobs"]}
+        current_jobs = {job["job_id"]: job for job in current["jobs"]}
+        explanations = []
+        for job_id in sorted(frozen_jobs.keys() | current_jobs.keys()):
+            before = frozen_jobs.get(job_id)
+            after = current_jobs.get(job_id)
+            before_node = before["effective_conclusion"] if before else None
+            after_node = after["effective_conclusion"] if after else None
+            if before_node == after_node and (before or {}).get("status") == (after or {}).get("status"):
+                continue
+            entry = {"job_id": job_id,
+                     "frozen_status": before["status"] if before else None,
+                     "current_status": after["status"] if after else None,
+                     "frozen_conclusion": before_node, "current_conclusion": after_node}
+            if after is not None:
+                entry["corrections"] = after.get("corrections", [])
+            explanations.append(entry)
+        return explanations

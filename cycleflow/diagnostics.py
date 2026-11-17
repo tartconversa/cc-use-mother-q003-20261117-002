@@ -51,10 +51,21 @@ class OperationsView:
                 if stage["completed_at"]:
                     milestones.append({"at": stage["completed_at"], "kind": "stage_finish",
                                        "stage": stage["stage"]})
-            for test in db.execute("SELECT test_id,tested_at,passed,failed,event_id FROM tests WHERE job_id=?", (job_id,)):
+            for test in db.execute("SELECT test_id,tested_at,passed,failed,event_id,state FROM tests WHERE job_id=?", (job_id,)):
                 milestones.append({"at": test["tested_at"], "kind": "tested", "stage": None,
                                    "test_id": test["test_id"], "passed": test["passed"],
-                                   "failed": test["failed"], "source_event_id": test["event_id"]})
+                                   "failed": test["failed"], "state": test["state"],
+                                   "source_event_id": test["event_id"]})
+            for correction in db.execute(
+                    "SELECT correction_id,action,recorded_at,passed,failed,event_id,state "
+                    "FROM test_corrections WHERE job_id=? ORDER BY recorded_at,correction_id",
+                    (job_id,)):
+                milestones.append({"at": correction["recorded_at"],
+                                   "kind": "test_voided" if correction["action"] == "void" else "test_corrected",
+                                   "stage": None, "correction_id": correction["correction_id"],
+                                   "passed": correction["passed"], "failed": correction["failed"],
+                                   "state": correction["state"],
+                                   "source_event_id": correction["event_id"]})
             if job["status"] == "scrapped":
                 milestones.append({"at": job["completed_at"], "kind": "scrapped", "stage": None})
             milestones.sort(key=lambda item: (item["at"], item["kind"]))
@@ -82,9 +93,10 @@ class OperationsView:
                 group["revisions"].add(job["revision"])
                 suppliers.add(lot["supplier"])
             for supplier in suppliers:
-                for test in job["tests"]:
-                    exposure[supplier]["passed"] += test["passed"]
-                    exposure[supplier]["failed"] += test["failed"]
+                conclusion = job["effective_conclusion"]
+                if conclusion and conclusion["state"] == "effective" and conclusion["passed"] is not None:
+                    exposure[supplier]["passed"] += conclusion["passed"]
+                    exposure[supplier]["failed"] += conclusion["failed"]
         result = []
         for name, group in sorted(exposure.items()):
             result.append({"supplier": name, "jobs": sorted(group["jobs"]),

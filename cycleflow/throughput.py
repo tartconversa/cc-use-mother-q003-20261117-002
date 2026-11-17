@@ -26,12 +26,13 @@ class ThroughputView:
             if job["completed_at"]:
                 completed_week = datetime.fromisoformat(job["completed_at"]).strftime("%G-W%V")
                 weeks[completed_week]["finished_jobs"] += 1
-            for test in job["tests"]:
-                tested_week = datetime.fromisoformat(test["tested_at"]).strftime("%G-W%V")
+            conclusion = job["effective_conclusion"]
+            if conclusion and conclusion["state"] == "effective" and conclusion["passed"] is not None:
+                tested_week = datetime.fromisoformat(conclusion["recorded_at"]).strftime("%G-W%V")
                 group = weeks[tested_week]
-                group["tested_units"] += test["passed"] + test["failed"]
-                group["passed_units"] += test["passed"]
-                group["failed_units"] += test["failed"]
+                group["tested_units"] += conclusion["passed"] + conclusion["failed"]
+                group["passed_units"] += conclusion["passed"]
+                group["failed_units"] += conclusion["failed"]
         result = []
         for week, metrics in sorted(weeks.items()):
             result.append({"week": week, **metrics, "job_ids": sorted(metrics["job_ids"])})
@@ -82,10 +83,11 @@ class ThroughputView:
             group["units"] += job["quantity"]
             if job["cycle_seconds"] is not None:
                 group["mean_cycle_inputs"].append(job["cycle_seconds"])
-            for test in job["tests"]:
-                group["tested"] += test["passed"] + test["failed"]
-                group["passed"] += test["passed"]
-                group["failed"] += test["failed"]
+            conclusion = job["effective_conclusion"]
+            if conclusion and conclusion["state"] == "effective" and conclusion["passed"] is not None:
+                group["tested"] += conclusion["passed"] + conclusion["failed"]
+                group["passed"] += conclusion["passed"]
+                group["failed"] += conclusion["failed"]
         cohorts = []
         for (revision, rework), group in sorted(groups.items()):
             samples = group.pop("mean_cycle_inputs")

@@ -64,6 +64,10 @@ class CycleService:
         with self.store.read() as db:
             return MeasurementRules(db).trace(test_id)
 
+    def get_correction(self, correction_id):
+        with self.store.read() as db:
+            return MeasurementRules(db).correction_trace(correction_id)
+
     def get_event(self, event_id):
         return self.ledger.get(event_id)
 

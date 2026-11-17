@@ -1,3 +1,4 @@
+from . import conclusions
 from .contracts import DomainError, MissingDependency, duration_seconds, keys, nonnegative_int, required_text
 from .design import DesignRules
 from .inventory import InventoryRules
@@ -12,7 +13,7 @@ class ExecutionRules:
         self.designs = DesignRules(db)
         self.inventory = InventoryRules(db)
 
-    def open(self, payload, occurred_at):
+    def open(self, payload, occurred_at, event_id=None):
         keys(payload, {"job_id", "design_id", "quantity"},
              {"job_id", "design_id", "quantity", "parent_job"})
         job_id = required_text(payload["job_id"], "job_id")
@@ -35,6 +36,8 @@ class ExecutionRules:
                 raise DomainError("time_order", "rework precedes original job")
         self.db.execute("INSERT INTO jobs(job_id,design_id,quantity,opened_at,status,parent_job) VALUES(?,?,?,?,?,?)",
                         (job_id, design_id, quantity, occurred_at, "open", parent_id))
+        if parent_id is not None and parent["status"] == "failed" and event_id is not None:
+            conclusions.record_rework_qualification(self.db, job_id, parent_id, event_id)
         allocations = self.inventory.reserve(job_id, design, quantity, occurred_at)
         return {"job_id": job_id, "status": "open", "allocations": allocations}
 
@@ -105,6 +108,9 @@ class ExecutionRules:
         result["reservations"] = self.inventory.reservations(job_id)
         result["stages"] = [dict(r) for r in self.db.execute(
             "SELECT stage,started_at,completed_at,event_id FROM job_steps WHERE job_id=? ORDER BY started_at,stage", (job_id,))]
+        result["rework_links"] = [dict(r) for r in self.db.execute(
+            "SELECT * FROM rework_links WHERE parent_job=? OR child_job=? ORDER BY child_job",
+            (job_id, job_id))]
         return result
 
     def lineage(self, job_id):
@@ -122,7 +128,7 @@ class ExecutionRules:
 
     def dispatch(self, kind, payload, occurred_at, event_id):
         if kind == "job.open":
-            return self.open(payload, occurred_at)
+            return self.open(payload, occurred_at, event_id)
         if kind == "job.stage_start":
             return self.start_stage(payload, occurred_at, event_id)
         if kind == "job.stage_finish":

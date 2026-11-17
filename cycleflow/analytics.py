@@ -2,6 +2,7 @@ from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
 
+from . import conclusions
 from .contracts import DomainError, duration_seconds, fingerprint, required_text, timestamp
 
 
@@ -33,6 +34,8 @@ class CycleAnalytics:
             job_ids = [row["job_id"] for row in jobs]
             steps = defaultdict(list)
             tests = defaultdict(list)
+            corrections = defaultdict(list)
+            effective = {}
             lots = defaultdict(list)
             source_events = set()
             for job in jobs:
@@ -46,25 +49,39 @@ class CycleAnalytics:
                     tests[job_id].append(item)
                     source_events.add(item["event_id"])
                 for row in db.execute(
+                        "SELECT * FROM test_corrections WHERE job_id=? ORDER BY recorded_at,correction_id",
+                        (job_id,)):
+                    item = dict(row)
+                    corrections[job_id].append(item)
+                    source_events.add(item["event_id"])
+                node = conclusions.effective_conclusion(db, job_id)
+                if node is not None:
+                    effective[job_id] = node
+                    source_events.add(node["event_id"])
+                for row in db.execute(
                     "SELECT r.lot_id,r.quantity,l.part,l.supplier FROM reservations r JOIN lots l ON l.lot_id=r.lot_id WHERE r.job_id=? ORDER BY l.part,r.lot_id",
                     (job_id,)):
                     lots[job_id].append(dict(row))
+            rework_links = [dict(row) for row in db.execute(
+                "SELECT * FROM rework_links ORDER BY child_job")]
             events = [dict(row) for row in db.execute(
                 "SELECT id,kind,state,error_code,occurred_at,payload FROM events WHERE state!='accepted' ORDER BY id")]
             head = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
-            revisions = self._revisions(jobs, steps, tests, lots)
+            revisions = self._revisions(jobs, steps, effective, lots)
             job_details = [self._job_detail(job, steps[job["job_id"]], tests[job["job_id"]],
-                                            lots[job["job_id"]]) for job in jobs]
-            quality = self._quality(jobs, steps, tests, events, design_rows, start, end)
-            summary = self._summary(jobs, tests, job_details)
+                                            corrections[job["job_id"]], effective.get(job["job_id"]),
+                                            lots[job["job_id"]], rework_links) for job in jobs]
+            quality = self._quality(jobs, steps, tests, effective, events, design_rows, start, end)
+            summary = self._summary(jobs, effective, job_details, rework_links)
             report = {"product": product, "window_start": start, "window_end": end,
                       "source_head": head, "designs": design_rows, "summary": summary,
                       "revisions": revisions, "jobs": job_details, "quality": quality,
+                      "rework_links": rework_links,
                       "source_event_ids": sorted(source_events)}
             report["fingerprint"] = fingerprint(report)
             return report
 
-    def _job_detail(self, job, steps, tests, lots):
+    def _job_detail(self, job, steps, tests, corrections, effective, lots, rework_links):
         stages = []
         completed = job["completed_at"]
         for step in steps:
@@ -81,16 +98,33 @@ class CycleAnalytics:
         total = duration_seconds(job["opened_at"], completed) if completed else None
         test_details = [{"test_id": test["test_id"], "plan_id": test["plan_id"],
                          "tested_at": test["tested_at"], "passed": test["passed"],
-                         "failed": test["failed"], "source_event_id": test["event_id"]} for test in tests]
+                         "failed": test["failed"], "state": test["state"],
+                         "source_event_id": test["event_id"]} for test in tests]
+        correction_details = [{
+            "correction_id": item["correction_id"], "action": item["action"],
+            "target_type": item["target_type"], "target_id": item["target_id"],
+            "recorded_at": item["recorded_at"], "passed": item["passed"], "failed": item["failed"],
+            "reason": item["reason"], "evidence": item["evidence"], "state": item["state"],
+            "source_event_id": item["event_id"]} for item in corrections]
+        effective_view = None
+        if effective is not None:
+            effective_view = {"node_type": effective["node_type"], "node_id": effective["node_id"],
+                              "state": effective["state"], "passed": effective["passed"],
+                              "failed": effective["failed"], "recorded_at": effective["recorded_at"],
+                              "source_event_id": effective["event_id"]}
+        links = [link for link in rework_links
+                 if link["parent_job"] == job["job_id"] or link["child_job"] == job["job_id"]]
         return {"job_id": job["job_id"], "design_id": job["design_id"],
                 "revision": job["revision"], "quantity": job["quantity"],
                 "status": job["status"], "opened_at": job["opened_at"],
                 "completed_at": completed, "parent_job": job["parent_job"],
                 "failure_reason": job["failure_reason"], "stages": stages,
-                "tests": test_details, "lots": lots, "wait_seconds": wait,
+                "tests": test_details, "corrections": correction_details,
+                "effective_conclusion": effective_view, "lots": lots,
+                "rework_links": links, "wait_seconds": wait,
                 "cycle_seconds": total}
 
-    def _revisions(self, jobs, steps, tests, lots):
+    def _revisions(self, jobs, steps, effective, lots):
         groups = defaultdict(lambda: {"jobs": 0, "units": 0, "tested": 0, "passed": 0,
                                       "failed": 0, "completed": 0, "scrapped": 0,
                                       "cycle_seconds": [], "stage_seconds": defaultdict(list),
@@ -107,10 +141,12 @@ class CycleAnalytics:
                 if step["completed_at"]:
                     group["stage_seconds"][step["stage"]].append(
                         duration_seconds(step["started_at"], step["completed_at"]))
-            for test in tests[job["job_id"]]:
-                group["tested"] += test["passed"] + test["failed"]
-                group["passed"] += test["passed"]
-                group["failed"] += test["failed"]
+            node = effective.get(job["job_id"])
+            # Only the single effective, non-void conclusion feeds yield math.
+            if node is not None and node["state"] == conclusions.EFFECTIVE and node["passed"] is not None:
+                group["tested"] += node["passed"] + node["failed"]
+                group["passed"] += node["passed"]
+                group["failed"] += node["failed"]
             for lot in lots[job["job_id"]]:
                 group["suppliers"][lot["supplier"]] += lot["quantity"]
         result = []
@@ -126,7 +162,7 @@ class CycleAnalytics:
                            "supplier_units": dict(sorted(group["suppliers"].items()))})
         return result
 
-    def _quality(self, jobs, steps, tests, events, designs, start, end):
+    def _quality(self, jobs, steps, tests, effective, events, designs, start, end):
         issues = []
         for job in jobs:
             job_id = job["job_id"]
@@ -134,8 +170,12 @@ class CycleAnalytics:
                 issues.append({"code": "unfinished_job", "subject": job_id})
             if job["status"] == "awaiting_test" and not tests[job_id]:
                 issues.append({"code": "missing_test", "subject": job_id})
-            if job["status"] == "completed" and not tests[job_id]:
-                issues.append({"code": "unexplained_completion", "subject": job_id})
+            if job["status"] == "awaiting_test" and tests[job_id]:
+                issues.append({"code": "voided_conclusion", "subject": job_id})
+            if job["status"] == "completed":
+                node = effective.get(job_id)
+                if node is None or node["state"] != conclusions.EFFECTIVE or node["passed"] is None:
+                    issues.append({"code": "unexplained_completion", "subject": job_id})
             if job["status"] == "failed" and not job["failure_reason"]:
                 issues.append({"code": "unexplained_failure", "subject": job_id})
             for step in steps[job_id]:
@@ -149,20 +189,23 @@ class CycleAnalytics:
             issues.append({"code": "unknown_product", "subject": "product"})
         return {"publishable": not issues, "issue_count": len(issues), "issues": issues}
 
-    def _summary(self, jobs, tests, details):
+    def _summary(self, jobs, effective, details, rework_links):
         passed = failed = 0
-        for items in tests.values():
-            for test in items:
-                passed += test["passed"]
-                failed += test["failed"]
+        for node in effective.values():
+            if node["state"] == conclusions.EFFECTIVE and node["passed"] is not None:
+                passed += node["passed"]
+                failed += node["failed"]
         completed = [item["cycle_seconds"] for item in details if item["cycle_seconds"] is not None]
         waiting = [item["wait_seconds"] for item in details if item["wait_seconds"] is not None]
+        rework_children = {job["job_id"] for job in jobs if job["parent_job"]}
+        retracted = {link["child_job"] for link in rework_links if link["state"] == "retracted"}
         return {"job_count": len(jobs), "unit_count": sum(job["quantity"] for job in jobs),
                 "tested_units": passed + failed, "passed_units": passed, "failed_units": failed,
                 "pass_rate": ratio(passed, passed + failed),
                 "mean_cycle_seconds": sum(completed) // len(completed) if completed else None,
                 "mean_wait_seconds": sum(waiting) // len(waiting) if waiting else None,
-                "rework_jobs": sum(bool(job["parent_job"]) for job in jobs)}
+                "rework_jobs": len(rework_children),
+                "retracted_rework_jobs": len(rework_children & retracted)}
 
     def compare(self, product, first_start, first_end, second_start, second_end):
         first = self.report(product, first_start, first_end)

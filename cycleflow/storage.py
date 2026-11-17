@@ -45,7 +45,24 @@ CREATE TABLE IF NOT EXISTS tests (
   test_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),
   plan_id TEXT NOT NULL REFERENCES plans(plan_id), tested_at TEXT NOT NULL,
   passed INTEGER NOT NULL, failed INTEGER NOT NULL, note TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'effective', event_id INTEGER NOT NULL REFERENCES events(id));
+CREATE TABLE IF NOT EXISTS test_corrections (
+  correction_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  plan_id TEXT NOT NULL REFERENCES plans(plan_id), action TEXT NOT NULL CHECK(action IN ('correct','void')),
+  target_type TEXT NOT NULL CHECK(target_type IN ('test','correction')),
+  target_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
+  passed INTEGER, failed INTEGER, reason TEXT NOT NULL, evidence TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'effective',
   event_id INTEGER NOT NULL REFERENCES events(id));
+CREATE INDEX IF NOT EXISTS ix_corrections_job ON test_corrections(job_id, recorded_at, correction_id);
+CREATE TABLE IF NOT EXISTS rework_links (
+  child_job TEXT PRIMARY KEY REFERENCES jobs(job_id), parent_job TEXT NOT NULL REFERENCES jobs(job_id),
+  qualification_event INTEGER NOT NULL REFERENCES events(id),
+  basis_test_id TEXT, basis_correction_id TEXT,
+  state TEXT NOT NULL DEFAULT 'active', retracted_event INTEGER REFERENCES events(id),
+  CHECK((basis_test_id IS NOT NULL AND basis_correction_id IS NULL)
+        OR (basis_test_id IS NULL AND basis_correction_id IS NOT NULL)));
+CREATE INDEX IF NOT EXISTS ix_rework_parent ON rework_links(parent_job);
 CREATE TABLE IF NOT EXISTS releases (
   release_id TEXT PRIMARY KEY, product TEXT NOT NULL, window_start TEXT NOT NULL,
   window_end TEXT NOT NULL, created_at TEXT NOT NULL, report TEXT NOT NULL,
@@ -64,8 +81,14 @@ class Store:
         db = self.connect()
         try:
             db.executescript(SCHEMA)
+            self._migrate(db)
         finally:
             db.close()
+
+    def _migrate(self, db):
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(tests)")}
+        if "state" not in columns:
+            db.execute("ALTER TABLE tests ADD COLUMN state TEXT NOT NULL DEFAULT 'effective'")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
